@@ -1049,6 +1049,29 @@ def build_parser():
     transport.add_argument("--http-stream-timeout", help=argparse.SUPPRESS)
 
     transport_ffmpeg.add_argument(
+        "--ffmpeg_dkey",
+        metavar="DKEY",
+        type=str,
+        help="""
+        Use a CENC decryption key to decrypt the media that ffmpeg receives as
+        an input from the DASH streaming that you play with streamlink.
+        If only one decryption key is provided, it will be used for both video and audio.
+        If --ffmpeg_dkey_2 is also provided, it will be used for the first track.
+        Example: --ffmpeg_dkey "<hex key>"
+        """
+    )
+    transport_ffmpeg.add_argument(
+        "--ffmpeg_dkey_2",
+        metavar="DKEY",
+        type=str,
+        help="""
+        Use a CENC decryption key to decrypt the media that ffmpeg receives as
+        an input from the DASH streaming that you play with streamlink.
+        This key will be used for the second track only.
+        Example: --decryption_key_2 "<hex key>"
+        """
+    )
+    transport_ffmpeg.add_argument(
         "--ffmpeg-ffmpeg",
         metavar="FILENAME",
         help="""
@@ -1285,6 +1308,8 @@ _ARGUMENT_TO_SESSIONOPTION: List[Tuple[str, str, Optional[Callable[[Any], Any]]]
     ("hls_segment_ignore_names", "hls-segment-ignore-names", None),
     ("hls_segment_key_uri", "hls-segment-key-uri", None),
     ("hls_audio_select", "hls-audio-select", None),
+    ("ffmpeg_dkey", "ffmpeg_dkey", None),
+    ("ffmpeg_dkey_2", "ffmpeg_dkey_2", None),
     ("dash_manifest_reload_attempts", "dash-manifest-reload-attempts", None),
     ("ffmpeg_ffmpeg", "ffmpeg-ffmpeg", None),
     ("ffmpeg_no_validation", "ffmpeg-no-validation", None),
