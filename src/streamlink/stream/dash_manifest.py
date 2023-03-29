@@ -1,13 +1,12 @@
 import copy
 import dataclasses
+import datetime
 import logging
 import math
 import re
 from collections import defaultdict
 from contextlib import contextmanager
-from datetime import datetime, timedelta
 from itertools import count, repeat
-from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -23,7 +22,6 @@ from typing import (
     Type,
     TypeVar,
     Union,
-    overload,
 )
 from urllib.parse import urljoin, urlparse, urlsplit, urlunparse, urlunsplit
 
@@ -32,8 +30,6 @@ from isodate import Duration, parse_datetime, parse_duration  # type: ignore[imp
 # noinspection PyProtectedMember
 from lxml.etree import _Attrib, _Element
 
-from streamlink.utils.times import UTC, fromtimestamp, now
-
 
 if TYPE_CHECKING:  # pragma: no cover
     from typing_extensions import Literal
@@ -41,37 +37,19 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
-EPOCH_START = fromtimestamp(0)
-ONE_SECOND = timedelta(seconds=1)
-
-SEGMENT_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+UTC = datetime.timezone.utc
+EPOCH_START = datetime.datetime(1970, 1, 1, tzinfo=UTC)
+ONE_SECOND = datetime.timedelta(seconds=1)
 
 
 @dataclasses.dataclass
 class Segment:
     url: str
-    number: Optional[int] = None
-    duration: Optional[float] = None
-    available_at: datetime = EPOCH_START
+    duration: float
     init: bool = False
     content: bool = True
+    available_at: datetime.datetime = EPOCH_START
     byterange: Optional[Tuple[int, Optional[int]]] = None
-
-    @property
-    def name(self) -> str:
-        if self.init and not self.content:
-            return "initialization"
-        if self.number is not None:
-            return str(self.number)
-        return Path(urlparse(self.url).path).resolve().name
-
-    @property
-    def available_in(self) -> float:
-        return max(0.0, (self.available_at - now()).total_seconds())
-
-    @property
-    def availability(self) -> str:
-        return f"{self.available_at.strftime(SEGMENT_TIME_FORMAT)} / {now().strftime(SEGMENT_TIME_FORMAT)}"
 
 
 @dataclasses.dataclass
@@ -88,8 +66,11 @@ def datetime_to_seconds(dt):
     return (dt - EPOCH_START).total_seconds()
 
 
-def count_dt(firstval: Optional[datetime] = None, step: timedelta = ONE_SECOND) -> Iterator[datetime]:
-    current = now() if firstval is None else firstval
+def count_dt(
+    firstval: Optional[datetime.datetime] = None,
+    step: datetime.timedelta = ONE_SECOND,
+) -> Iterator[datetime.datetime]:
+    current = datetime.datetime.now(tz=UTC) if firstval is None else firstval
     while True:
         yield current
         current += step
@@ -117,11 +98,11 @@ class MPDParsers:
         return mpdtype
 
     @staticmethod
-    def duration(duration: str) -> Union[timedelta, Duration]:
+    def duration(duration: str) -> Union[datetime.timedelta, Duration]:
         return parse_duration(duration)
 
     @staticmethod
-    def datetime(dt: str) -> datetime:
+    def datetime(dt: str) -> datetime.datetime:
         return parse_datetime(dt).replace(tzinfo=UTC)
 
     @staticmethod
@@ -145,7 +126,7 @@ class MPDParsers:
     @staticmethod
     def timedelta(timescale: float = 1):
         def _timedelta(seconds):
-            return timedelta(seconds=int(float(seconds) / float(timescale)))
+            return datetime.timedelta(seconds=int(float(seconds) / float(timescale)))
 
         return _timedelta
 
@@ -175,7 +156,14 @@ class MPDNode:
 
     parent: "MPDNode"
 
-    def __init__(self, node: _Element, root: "MPD", parent: "MPDNode", **kwargs) -> None:
+    def __init__(
+        self,
+        node: _Element,
+        root: "MPD",
+        parent: "MPDNode",
+        *args,
+        **kwargs,
+    ):
         self.node = node
         self.root = root
         self.parent = parent
@@ -195,64 +183,26 @@ class MPDNode:
     def __str__(self):
         return f"<{self.__tag__} {' '.join(f'@{attr}={getattr(self, attr)}' for attr in self.attributes)}>"
 
-    @overload
-    def attr(  # type: ignore[misc]  # "Overloaded function signatures 1 and 2 overlap with incompatible return types"
-        self,
-        key: str,
-        parser: None = None,
-        default: None = None,
-        required: bool = False,
-        inherited: Optional[Union[Type[TMPDNode], Sequence[Type[TMPDNode]]]] = None,
-    ) -> Optional[str]:  # pragma: no cover
-        pass
-
-    @overload
     def attr(
         self,
         key: str,
-        parser: None,
-        default: TAttrDefault,
+        default: TAttrDefault = None,
+        parser: Optional[Callable[[Any], TAttrParseResult]] = None,
         required: bool = False,
-        inherited: Optional[Union[Type[TMPDNode], Sequence[Type[TMPDNode]]]] = None,
-    ) -> TAttrDefault:  # pragma: no cover
-        pass
-
-    @overload
-    def attr(
-        self,
-        key: str,
-        parser: Callable[[Any], TAttrParseResult],
-        default: None = None,
-        required: bool = False,
-        inherited: Optional[Union[Type[TMPDNode], Sequence[Type[TMPDNode]]]] = None,
-    ) -> Optional[TAttrParseResult]:  # pragma: no cover
-        pass
-
-    @overload
-    def attr(
-        self,
-        key: str,
-        parser: Callable[[Any], TAttrParseResult],
-        default: TAttrDefault,
-        required: bool = False,
-        inherited: Optional[Union[Type[TMPDNode], Sequence[Type[TMPDNode]]]] = None,
-    ) -> Union[TAttrParseResult, TAttrDefault]:  # pragma: no cover
-        pass
-
-    def attr(self, key, parser=None, default=None, required=False, inherited=None):
+        inherited: bool = False,
+    ) -> Union[TAttrParseResult, TAttrDefault, Any]:
         self.attributes.add(key)
         if key in self.attrib:
-            value = self.attrib.get(key)
+            value: Any = self.attrib.get(key)
             if parser and callable(parser):
                 return parser(value)
             else:
                 return value
         elif inherited:
-            value = self.walk_back_get_attr(key, inherited)
-            if value is not None:
-                return value
+            if self.parent and hasattr(self.parent, key) and getattr(self.parent, key):
+                return getattr(self.parent, key)
 
-        if required:  # pragma: no cover
+        if required:
             raise MPDParsingError(f"Could not find required attribute {self.__tag__}@{key} ")
 
         return default
@@ -284,27 +234,18 @@ class MPDNode:
 
     def walk_back(
         self,
-        cls: Optional[Union[Type[TMPDNode], Sequence[Type[TMPDNode]]]] = None,
-        mapper: Callable[["MPDNode"], Optional["MPDNode"]] = _identity,
-    ) -> Iterator["MPDNode"]:
+        cls: Optional[Type[TMPDNode]] = None,
+        f: Callable[["MPDNode"], "MPDNode"] = _identity,
+    ) -> Iterator[Union[TMPDNode, "MPDNode"]]:
         node = self.parent
         while node:
-            if cls is None or isinstance(node, cls):  # type: ignore[arg-type]
-                n = mapper(node)  # type: ignore[arg-type]
-                if n is not None:
-                    yield n
+            if cls is None or cls.__tag__ == node.__tag__:
+                yield f(node)
             node = node.parent
 
-    def walk_back_get_attr(
-        self,
-        attr: str,
-        cls: Optional[Union[Type[TMPDNode], Sequence[Type[TMPDNode]]]] = None,
-        mapper: Callable[["MPDNode"], Optional["MPDNode"]] = _identity,
-    ) -> Optional[Any]:
-        for ancestor in self.walk_back(cls, mapper):
-            value = getattr(ancestor, attr, None)
-            if value is not None:
-                return value
+    def walk_back_get_attr(self, attr: str) -> Optional[Any]:
+        parent_attrs = [getattr(n, attr) for n in self.walk_back() if hasattr(n, attr)]
+        return parent_attrs[0] if len(parent_attrs) else None
 
     @property
     def base_url(self):
@@ -326,11 +267,12 @@ class MPD(MPDNode):
     parent: None  # type: ignore[assignment]
     timelines: Dict[TTimelineIdent, int]
 
-    def __init__(self, *args, url: Optional[str] = None, **kwargs) -> None:
+    def __init__(self, node, url=None, *args, **kwargs):
         # top level has no parent
-        kwargs["root"] = self
-        kwargs["parent"] = None
-        super().__init__(*args, **kwargs)
+        kwargs.pop("root", None)
+        kwargs.pop("parent", None)
+        # noinspection PyTypeChecker
+        super().__init__(node, root=self, parent=None, *args, **kwargs)
 
         # parser attributes
         self.url = url
@@ -350,9 +292,9 @@ class MPD(MPDNode):
         self.minimumUpdatePeriod = self.attr(
             "minimumUpdatePeriod",
             parser=MPDParsers.duration,
-            default=timedelta(),
+            default=datetime.timedelta(),
         )
-        self.minBufferTime: Union[timedelta, Duration] = self.attr(
+        self.minBufferTime = self.attr(
             "minBufferTime",
             parser=MPDParsers.duration,
             required=True,
@@ -379,21 +321,20 @@ class MPD(MPDNode):
         self.mediaPresentationDuration = self.attr(
             "mediaPresentationDuration",
             parser=MPDParsers.duration,
-            default=timedelta(),
         )
         self.suggestedPresentationDelay = self.attr(
             "suggestedPresentationDelay",
             parser=MPDParsers.duration,
             # if there is no delay, use a delay of 3 seconds
             # TODO: add a customizable parameter for this
-            default=timedelta(seconds=3),
+            default=datetime.timedelta(seconds=3),
         )
 
         # parse children
         location = self.children(Location)
         self.location = location[0] if location else None
         if self.location:
-            self.url = self.location.text or ""
+            self.url = self.location.text
             urlp = list(urlparse(self.url))
             if urlp[2]:
                 urlp[2], _ = urlp[2].rsplit("/", 1)
@@ -403,16 +344,6 @@ class MPD(MPDNode):
         self.periods = self.children(Period, minimum=1)
         self.programInformation = self.children(ProgramInformation)
 
-    def get_representation(self, ident: TTimelineIdent) -> Optional["Representation"]:
-        """
-        Find the first Representation instance with a matching ident
-        """
-        for period in self.periods:
-            for adaptationset in period.adaptationSets:
-                for representation in adaptationset.representations:
-                    if representation.ident == ident:
-                        return representation
-
 
 class ProgramInformation(MPDNode):
     __tag__ = "ProgramInformation"
@@ -421,10 +352,10 @@ class ProgramInformation(MPDNode):
 class BaseURL(MPDNode):
     __tag__ = "BaseURL"
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, node, root=None, parent=None, *args, **kwargs):
+        super().__init__(node, root, parent, *args, **kwargs)
 
-        self.url = (self.text or "").strip()
+        self.url = self.text.strip()
 
     @property
     def is_absolute(self) -> bool:
@@ -452,8 +383,8 @@ class Location(MPDNode):
 class Period(MPDNode):
     __tag__ = "Period"
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, node, root=None, parent=None, *args, **kwargs):
+        super().__init__(node, root, parent, *args, **kwargs)
 
         self.i = kwargs.get("i", 0)
         self.id = self.attr("id")
@@ -464,16 +395,16 @@ class Period(MPDNode):
         self.duration = self.attr(
             "duration",
             parser=MPDParsers.duration,
-            default=timedelta(),
+            default=datetime.timedelta(),
         )
         self.start = self.attr(
             "start",
             parser=MPDParsers.duration,
-            default=timedelta(),
+            default=datetime.timedelta(),
         )
 
         # anchor time for segment availability
-        offset = self.start if self.root.type == "dynamic" else timedelta()
+        offset = self.start if self.root.type == "dynamic" else datetime.timedelta()
         self.availabilityStartTime = self.root.availabilityStartTime + offset
 
         # TODO: Early Access Periods
@@ -488,6 +419,10 @@ class Period(MPDNode):
         self.subset = self.children(Subset)
 
 
+class SegmentBase(MPDNode):
+    __tag__ = "SegmentBase"
+
+
 class AssetIdentifier(MPDNode):
     __tag__ = "AssetIdentifier"
 
@@ -500,82 +435,136 @@ class EventStream(MPDNode):
     __tag__ = "EventStream"
 
 
-class _RepresentationBaseType(MPDNode):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+class Initialization(MPDNode):
+    __tag__ = "Initialization"
 
-        # mimeType must be set on the AdaptationSet or Representation
-        self.mimeType: str = self.attr(  # type: ignore[assignment]
-            "mimeType",
-            required=type(self) is Representation,
-            inherited=_RepresentationBaseType,
+    def __init__(self, node, root=None, parent=None, *args, **kwargs):
+        super().__init__(node, root, parent, *args, **kwargs)
+
+        self.source_url = self.attr("sourceURL")
+        self.range = self.attr(
+            "range",
+            parser=MPDParsers.range,
         )
 
-        self.profiles = self.attr(
-            "profiles",
-            inherited=_RepresentationBaseType,
+
+class SegmentURL(MPDNode):
+    __tag__ = "SegmentURL"
+
+    def __init__(self, node, root=None, parent=None, *args, **kwargs):
+        super().__init__(node, root, parent, *args, **kwargs)
+
+        self.media = self.attr("media")
+        self.media_range = self.attr(
+            "mediaRange",
+            parser=MPDParsers.range,
         )
-        self.width = self.attr(
-            "width",
+
+
+class SegmentList(MPDNode):
+    __tag__ = "SegmentList"
+
+    period: "Period"
+
+    def __init__(self, node, root=None, parent=None, period=None, *args, **kwargs):
+        super().__init__(node, root, parent, *args, **kwargs)
+
+        self.period = period
+
+        self.presentation_time_offset = self.attr("presentationTimeOffset")
+        self.timescale = self.attr(
+            "timescale",
             parser=int,
-            inherited=_RepresentationBaseType,
         )
-        self.height = self.attr(
-            "height",
+        self.duration = self.attr(
+            "duration",
             parser=int,
-            inherited=_RepresentationBaseType,
         )
-        self.sar = self.attr(
-            "sar",
-            inherited=_RepresentationBaseType,
-        )
-        self.frameRate = self.attr(
-            "frameRate",
-            parser=MPDParsers.frame_rate,
-            inherited=_RepresentationBaseType,
-        )
-        self.audioSamplingRate = self.attr(
-            "audioSamplingRate",
+        self.start_number = self.attr(
+            "startNumber",
             parser=int,
-            inherited=_RepresentationBaseType,
-        )
-        self.codecs = self.attr(
-            "codecs",
-            inherited=_RepresentationBaseType,
-        )
-        self.scanType = self.attr(
-            "scanType",
-            inherited=_RepresentationBaseType,
+            default=1,
         )
 
-        self.contentProtections = self.children(ContentProtection)
+        if self.duration:
+            self.duration_seconds = self.duration / float(self.timescale)
+        else:
+            self.duration_seconds = None
+
+        self.initialization = self.only_child(Initialization)
+        self.segment_urls = self.children(SegmentURL, minimum=1)
+
+    @property
+    def segments(self) -> Iterator[Segment]:
+        if self.initialization:  # pragma: no branch
+            yield Segment(
+                url=self.make_url(self.initialization.source_url),
+                duration=0,
+                init=True,
+                content=False,
+                available_at=self.period.availabilityStartTime,
+                byterange=self.initialization.range,
+            )
+        for n, segment_url in enumerate(self.segment_urls, self.start_number):
+            yield Segment(
+                url=self.make_url(segment_url.media),
+                duration=self.duration_seconds,
+                available_at=self.period.availabilityStartTime,
+                byterange=segment_url.media_range,
+            )
+
+    def make_url(self, url: str) -> str:
+        return BaseURL.join(self.base_url, url)
 
 
-class AdaptationSet(_RepresentationBaseType):
+class AdaptationSet(MPDNode):
     __tag__ = "AdaptationSet"
 
-    parent: Period
+    parent: "Period"
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, node, root=None, parent=None, *args, **kwargs):
+        super().__init__(node, root, parent, *args, **kwargs)
 
         self.id = self.attr("id")
         self.group = self.attr("group")
+        self.mimeType = self.attr("mimeType")
         self.lang = self.attr("lang")
         self.contentType = self.attr("contentType")
         self.par = self.attr("par")
-        self.minBandwidth = self.attr("minBandwidth", parser=int)
-        self.maxBandwidth = self.attr("maxBandwidth", parser=int)
-        self.minWidth = self.attr("minWidth", parser=int)
-        self.maxWidth = self.attr("maxWidth", parser=int)
-        self.minHeight = self.attr("minHeight", parser=int)
-        self.maxHeight = self.attr("maxHeight", parser=int)
-        self.minFrameRate = self.attr("minFrameRate", parser=MPDParsers.frame_rate)
-        self.maxFrameRate = self.attr("maxFrameRate", parser=MPDParsers.frame_rate)
+        self.minBandwidth = self.attr("minBandwidth")
+        self.maxBandwidth = self.attr("maxBandwidth")
+        self.minWidth = self.attr(
+            "minWidth",
+            parser=int,
+        )
+        self.maxWidth = self.attr(
+            "maxWidth",
+            parser=int,
+        )
+        self.minHeight = self.attr(
+            "minHeight",
+            parser=int,
+        )
+        self.maxHeight = self.attr(
+            "maxHeight",
+            parser=int,
+        )
+        self.minFrameRate = self.attr(
+            "minFrameRate",
+            parser=MPDParsers.frame_rate,
+        )
+        self.maxFrameRate = self.attr(
+            "maxFrameRate",
+            parser=MPDParsers.frame_rate,
+        )
         self.segmentAlignment = self.attr(
             "segmentAlignment",
             parser=MPDParsers.bool_str,
             default=False,
+        )
+        self.bitstreamSwitching = self.attr(
+            "bitstreamSwitching",
+            parser=MPDParsers.bool_str,
         )
         self.subsegmentAlignment = self.attr(
             "subsegmentAlignment",
@@ -587,246 +576,89 @@ class AdaptationSet(_RepresentationBaseType):
             parser=int,
             default=0,
         )
-        self.bitstreamSwitching = self.attr(
-            "bitstreamSwitching",
-            parser=MPDParsers.bool_str,
-        )
 
         self.baseURLs = self.children(BaseURL)
-        self.segmentBase = self.only_child(SegmentBase, period=self.parent)
-        self.segmentList = self.only_child(SegmentList, period=self.parent)
         self.segmentTemplate = self.only_child(SegmentTemplate, period=self.parent)
         self.representations = self.children(Representation, minimum=1, period=self.parent)
+        self.contentProtection = self.children(ContentProtection)
 
 
-class Representation(_RepresentationBaseType):
-    __tag__ = "Representation"
-
-    parent: AdaptationSet
-
-    def __init__(self, *args, period: Period, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-
-        self.period = period
-
-        self.id: str = self.attr(  # type: ignore[assignment]
-            "id",
-            required=True,
-        )
-        self.bandwidth: float = self.attr(  # type: ignore[assignment]
-            "bandwidth",
-            parser=lambda b: float(b) / 1000.0,
-            required=True,
-        )
-
-        self.ident = self.parent.parent.id, self.parent.id, self.id
-
-        self.baseURLs = self.children(BaseURL)
-        self.subRepresentations = self.children(SubRepresentation)
-        self.segmentBase = self.only_child(SegmentBase, period=self.period)
-        self.segmentList = self.only_child(SegmentList, period=self.period)
-        self.segmentTemplate = self.only_child(SegmentTemplate, period=self.period)
-
-    @property
-    def lang(self):
-        return self.parent.lang
-
-    @property
-    def bandwidth_rounded(self) -> float:
-        return round(self.bandwidth, 1 - int(math.log10(self.bandwidth)))
-
-    def segments(self, timestamp: Optional[datetime] = None, **kwargs) -> Iterator[Segment]:
-        """
-        Segments are yielded when they are available
-
-        Segments appear on a timeline, for dynamic content they are only available at a certain time
-        and sometimes for a limited time. For static content they are all available at the same time.
-
-        :param timestamp: Optional initial timestamp for syncing timelines of multiple substreams
-        :param kwargs: extra args to pass to the segment template
-        :return: yields Segments
-        """
-
-        # segmentBase = self.segmentBase or self.walk_back_get_attr("segmentBase")
-        segmentList = self.segmentList or self.walk_back_get_attr("segmentList")
-        segmentTemplate = self.segmentTemplate or self.walk_back_get_attr("segmentTemplate")
-
-        if segmentTemplate:
-            yield from segmentTemplate.segments(
-                self.ident,
-                self.base_url,
-                timestamp=timestamp,
-                RepresentationID=self.id,
-                Bandwidth=int(self.bandwidth * 1000),
-                **kwargs,
-            )
-        elif segmentList:
-            yield from segmentList.segments()
-        else:
-            yield Segment(
-                url=self.base_url,
-                number=None,
-                duration=self.period.duration.total_seconds() or self.root.mediaPresentationDuration.total_seconds(),
-                available_at=self.period.availabilityStartTime,
-                init=True,
-                content=True,
-                byterange=None,
-            )
-
-
-class SubRepresentation(_RepresentationBaseType):
-    __tag__ = "SubRepresentation"
-
-
-class _SegmentBaseType(MPDNode):
-    parent: Union[Period, AdaptationSet, Representation]
-
-    _ancestors = (Period, AdaptationSet, Representation)
-
-    def __init__(self, *args, period: "Period", **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-
-        self.period = period
-
-        self.timescale: int = self.attr(
-            "timescale",
-            parser=int,
-            default=self._find_default("timescale", 1),
-        )
-        self.presentationTimeOffset: timedelta = self.attr(
-            "presentationTimeOffset",
-            parser=MPDParsers.timedelta(self.timescale),
-            default=self._find_default("presentationTimeOffset", timedelta()),
-        )
-        self.availabilityTimeOffset: timedelta = self.attr(
-            "availabilityTimeOffset",
-            parser=MPDParsers.timedelta(self.timescale),
-            default=self._find_default("availabilityTimeOffset", timedelta()),
-        )
-
-        self.initialization = self.only_child(Initialization) or self._find_default("initialization")
-
-    def _find_default(self, attr: str, default: TAttrDefault = None) -> Union[TAttrDefault, Any]:
-        """Find default values from nodes of the same type on ancestor nodes"""
-        # the node attribute on each ancestor is named after its node tag, with the first character being lowercase
-        nodeattr = f"{self.__tag__[0].lower()}{self.__tag__[1:]}"
-        # start with the parent node, to avoid an unnecessary failed lookup on the current node
-        value = self.parent.walk_back_get_attr(
-            attr,
-            self._ancestors,
-            lambda node: getattr(node, nodeattr, None),
-        )
-        return default if value is None else value
-
-
-class _MultipleSegmentBaseType(_SegmentBaseType):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-
-        self.duration = self.attr(
-            "duration",
-            parser=int,
-            default=self._find_default("duration"),
-        )
-        self.startNumber: int = self.attr(
-            "startNumber",
-            parser=int,
-            default=self._find_default("startNumber", 1),
-        )
-
-        self.duration_seconds = self.duration / self.timescale if self.duration else None
-
-        self.segmentTimeline = self.only_child(SegmentTimeline) or self._find_default("segmentTimeline")
-
-
-class SegmentBase(_SegmentBaseType):
-    __tag__ = "SegmentBase"
-
-
-class SegmentList(_MultipleSegmentBaseType):
-    __tag__ = "SegmentList"
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-
-        self.segmentURLs = self.children(SegmentURL)
-
-    def segments(self) -> Iterator[Segment]:
-        if self.initialization:  # pragma: no branch
-            yield Segment(
-                url=self.make_url(self.initialization.source_url),
-                number=None,
-                duration=None,
-                available_at=self.period.availabilityStartTime,
-                init=True,
-                content=False,
-                byterange=self.initialization.range,
-            )
-        for number, segment_url in enumerate(self.segmentURLs, self.startNumber):
-            yield Segment(
-                url=self.make_url(segment_url.media),
-                number=number,
-                duration=self.duration_seconds,
-                available_at=self.period.availabilityStartTime,
-                init=False,
-                content=True,
-                byterange=segment_url.media_range,
-            )
-
-    def make_url(self, url: Optional[str]) -> str:
-        return BaseURL.join(self.base_url, url) if url else self.base_url
-
-
-class SegmentTemplate(_MultipleSegmentBaseType):
+class SegmentTemplate(MPDNode):
     __tag__ = "SegmentTemplate"
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    parent: Union["Period", "AdaptationSet", "Representation"]
+    period: "Period"
 
-        self.fmt_initialization = self.attr(
+    def __init__(self, node, root=None, parent=None, period=None, *args, **kwargs):
+        super().__init__(node, root, parent, *args, **kwargs)
+
+        self.period = period
+
+        self.defaultSegmentTemplate = self.walk_back_get_attr("segmentTemplate")
+
+        self.initialization = self.attr(
             "initialization",
             parser=MPDParsers.segment_template,
         )
-        self.fmt_media = self.attr(
+        self.media = self.attr(
             "media",
             parser=MPDParsers.segment_template,
         )
+        self.duration = self.attr(
+            "duration",
+            parser=int,
+            default=self.defaultSegmentTemplate.duration if self.defaultSegmentTemplate else None,
+        )
+        self.timescale = self.attr(
+            "timescale",
+            parser=int,
+            default=self.defaultSegmentTemplate.timescale if self.defaultSegmentTemplate else 1,
+        )
+        self.startNumber = self.attr(
+            "startNumber",
+            parser=int,
+            default=self.defaultSegmentTemplate.startNumber if self.defaultSegmentTemplate else 1,
+        )
+        self.presentationTimeOffset = self.attr(
+            "presentationTimeOffset",
+            parser=MPDParsers.timedelta(self.timescale),
+            default=datetime.timedelta(),
+        )
 
-    def segments(
-        self,
-        ident: TTimelineIdent,
-        base_url: str,
-        timestamp: Optional[datetime] = None,
-        **kwargs,
-    ) -> Iterator[Segment]:
+        self.duration_seconds = self.duration / self.timescale if self.duration and self.timescale else None
+
+        # children
+        self.segmentTimeline = self.only_child(SegmentTimeline)
+
+    def segments(self, ident: TTimelineIdent, base_url: str, **kwargs) -> Iterator[Segment]:
         if kwargs.pop("init", True):  # pragma: no branch
             init_url = self.format_initialization(base_url, **kwargs)
             if init_url:  # pragma: no branch
                 yield Segment(
                     url=init_url,
-                    number=None,
-                    duration=None,
-                    available_at=self.period.availabilityStartTime,
+                    duration=0,
                     init=True,
                     content=False,
-                    byterange=None,
+                    available_at=self.period.availabilityStartTime,
                 )
-        for media_url, number, available_at in self.format_media(ident, base_url, timestamp=timestamp, **kwargs):
+        for media_url, available_at in self.format_media(ident, base_url, **kwargs):
             yield Segment(
                 url=media_url,
-                number=number,
                 duration=self.duration_seconds,
-                available_at=available_at,
                 init=False,
                 content=True,
-                byterange=None,
+                available_at=available_at,
             )
 
     @staticmethod
     def make_url(base_url: str, url: str) -> str:
         return BaseURL.join(base_url, url)
 
-    def segment_numbers(self, timestamp: Optional[datetime] = None) -> Iterator[Tuple[int, datetime]]:
+    def format_initialization(self, base_url: str, **kwargs) -> Optional[str]:
+        if self.initialization:
+            return self.make_url(base_url, self.initialization(**kwargs))
+
+    def segment_numbers(self) -> Iterator[Tuple[int, datetime.datetime]]:
         """
         yield the segment number and when it will be available.
 
@@ -843,37 +675,39 @@ class SegmentTemplate(_MultipleSegmentBaseType):
             raise MPDParsingError("Unknown segment durations: missing duration/timescale attributes on SegmentTemplate")
 
         number_iter: Union[Iterator[int], Sequence[int]]
-        available_iter: Iterator[datetime]
+        available_iter: Iterator[datetime.datetime]
 
         if self.root.type == "static":
             available_iter = repeat(self.period.availabilityStartTime)
-            duration = self.period.duration.total_seconds() or self.root.mediaPresentationDuration.total_seconds()
+            duration = self.period.duration.seconds or self.root.mediaPresentationDuration.seconds
             if duration:
                 number_iter = range(self.startNumber, int(duration / self.duration_seconds) + 1)
             else:
                 number_iter = count(self.startNumber)
         else:
-            current_time = timestamp or now()
-            since_start = current_time - self.period.availabilityStartTime - self.presentationTimeOffset
+            now = datetime.datetime.now(UTC)
+            since_start = now - self.period.availabilityStartTime - self.presentationTimeOffset
 
             suggested_delay = self.root.suggestedPresentationDelay
             buffer_time = self.root.minBufferTime
 
             # Segment number
+            # To reduce unnecessary delay, start with the next/upcoming segment: +1
             seconds_offset = (since_start - suggested_delay - buffer_time).total_seconds()
-            number_offset = max(0, int(seconds_offset / self.duration_seconds))
+            number_offset = max(0, int(seconds_offset / self.duration_seconds) + 1)
             number_iter = count(self.startNumber + number_offset)
 
             # Segment availability time
-            available_offset = timedelta(seconds=number_offset * self.duration_seconds)
+            # The availability time marks the segment's beginning: -1
+            available_offset = datetime.timedelta(seconds=max(0, number_offset - 1) * self.duration_seconds)
             available_start = self.period.availabilityStartTime + available_offset
             available_iter = count_dt(
                 available_start,
-                timedelta(seconds=self.duration_seconds),
+                datetime.timedelta(seconds=self.duration_seconds),
             )
 
             log.debug(f"Stream start: {self.period.availabilityStartTime}")
-            log.debug(f"Current time: {current_time}")
+            log.debug(f"Current time: {now}")
             log.debug(f"Availability: {available_start}")
             log.debug("; ".join([
                 f"presentationTimeOffset: {self.presentationTimeOffset}",
@@ -888,71 +722,171 @@ class SegmentTemplate(_MultipleSegmentBaseType):
 
         yield from zip(number_iter, available_iter)
 
-    def segment_timeline(self, ident: TTimelineIdent) -> Iterator[Tuple[int, TimelineSegment, datetime]]:
-        if not self.segmentTimeline:  # pragma: no cover
-            raise MPDParsingError("Missing SegmentTimeline in SegmentTemplate")
+    def format_media(self, ident: TTimelineIdent, base_url: str, **kwargs) -> Iterator[Tuple[str, datetime.datetime]]:
+        if not self.segmentTimeline:
+            log.debug(f"Generating segment numbers for {self.root.type} playlist: {ident!r}")
+            for number, available_at in self.segment_numbers():
+                url = self.make_url(base_url, self.media(Number=number, **kwargs))
+                yield url, available_at
+            return
+
+        log.debug(f"Generating segment timeline for {self.root.type} playlist: {ident!r}")
 
         if self.root.type == "static":
-            yield from zip(count(self.startNumber), self.segmentTimeline.segments, repeat(self.period.availabilityStartTime))
-        else:
-            time = self.root.timelines[ident]
-            is_initial = time == -1
+            available_at = self.period.availabilityStartTime
+            for segment, n in zip(self.segmentTimeline.segments, count(self.startNumber)):
+                url = self.make_url(base_url, self.media(Time=segment.t, Number=n, **kwargs))
+                yield url, available_at
+            return
 
-            publish_time = self.root.publishTime or EPOCH_START
-            threshold = publish_time - self.root.suggestedPresentationDelay
+        # Convert potential `isodate.Duration` instance to `datetime.timedelta` (relative to now)
+        now = datetime.datetime.now(UTC)
+        suggested_delay: datetime.timedelta = now + self.root.suggestedPresentationDelay - now
 
-            # transform the timeline into a segment list
-            timeline = []
-            available_at = publish_time
+        publish_time = self.root.publishTime or EPOCH_START
 
+        # transform the timeline into a segment list
+        timeline = []
+        available_at = publish_time
+        for segment, n in reversed(list(zip(self.segmentTimeline.segments, count(self.startNumber)))):
             # the last segment in the timeline is the most recent one
             # so, work backwards and calculate when each of the segments was
             # available, based on the durations relative to the publish-time
-            for number, segment in reversed(list(zip(count(self.startNumber), self.segmentTimeline.segments))):
-                # stop once the suggestedPresentationDelay is reached on the first manifest parsing
-                # or when a segment with a lower or equal time value was already returned from an earlier manifest
-                if is_initial and available_at <= threshold or segment.t <= time:
-                    break
+            url = self.make_url(base_url, self.media(Time=segment.t, Number=n, **kwargs))
+            duration = datetime.timedelta(seconds=segment.d / self.timescale)
 
-                timeline.append((number, segment, available_at))
-                available_at -= timedelta(seconds=segment.d / self.timescale)
+            # once the suggested_delay is reached, stop
+            if self.root.timelines[ident] == -1 and publish_time - available_at >= suggested_delay:
+                break
 
-            # return the segments in chronological order
-            for number, segment, available_at in reversed(timeline):
-                self.root.timelines[ident] = segment.t
-                yield number, segment, available_at
+            timeline.append((url, available_at, segment.t))
 
-    def format_initialization(self, base_url: str, **kwargs) -> Optional[str]:
-        if self.fmt_initialization is not None:  # pragma: no branch
-            return self.make_url(base_url, self.fmt_initialization(**kwargs))
+            available_at -= duration  # walk backwards in time
 
-    def format_media(
-        self,
-        ident: TTimelineIdent,
-        base_url: str,
-        timestamp: Optional[datetime] = None,
-        **kwargs,
-    ) -> Iterator[Tuple[str, int, datetime]]:
-        if self.fmt_media is None:  # pragma: no cover
-            return
+        # return the segments in chronological order
+        for url, available_at, t in reversed(timeline):
+            if t > self.root.timelines[ident]:
+                self.root.timelines[ident] = t
+                yield url, available_at
 
-        if not self.segmentTimeline:
-            log.debug(f"Generating segment numbers for {self.root.type} playlist: {ident!r}")
-            for number, available_at in self.segment_numbers(timestamp=timestamp):
-                url = self.make_url(base_url, self.fmt_media(Number=number, **kwargs))
-                yield url, number, available_at
+
+class Representation(MPDNode):
+    __tag__ = "Representation"
+
+    parent: "AdaptationSet"
+    period: "Period"
+
+    def __init__(self, node, root=None, parent=None, period=None, *args, **kwargs):
+        super().__init__(node, root, parent, *args, **kwargs)
+
+        self.period = period
+
+        self.id = self.attr(
+            "id",
+            required=True,
+        )
+        self.bandwidth = self.attr(
+            "bandwidth",
+            parser=lambda b: float(b) / 1000.0,
+            required=True,
+        )
+        self.mimeType = self.attr(
+            "mimeType",
+            required=True,
+            inherited=True,
+        )
+
+        self.codecs = self.attr("codecs")
+        self.startWithSAP = self.attr("startWithSAP")
+
+        # video
+        self.width = self.attr(
+            "width",
+            parser=int,
+        )
+        self.height = self.attr(
+            "height",
+            parser=int,
+        )
+        self.frameRate = self.attr(
+            "frameRate",
+            parser=MPDParsers.frame_rate,
+        )
+
+        # audio
+        self.audioSamplingRate = self.attr(
+            "audioSamplingRate",
+            parser=int,
+        )
+        self.numChannels = self.attr(
+            "numChannels",
+            parser=int,
+        )
+
+        # subtitle
+        self.lang = self.attr(
+            "lang",
+            inherited=True,
+        )
+
+        self.ident = self.parent.parent.id, self.parent.id, self.id
+
+        self.baseURLs = self.children(BaseURL)
+        self.subRepresentation = self.children(SubRepresentation)
+        self.segmentBase = self.only_child(SegmentBase, period=self.period)
+        self.segmentList = self.children(SegmentList, period=self.period)
+        self.segmentTemplate = self.only_child(SegmentTemplate, period=self.period)
+        self.contentProtection = self.children(ContentProtection)
+
+    @property
+    def bandwidth_rounded(self) -> float:
+        return round(self.bandwidth, 1 - int(math.log10(self.bandwidth)))
+
+    def segments(self, **kwargs) -> Iterator[Segment]:
+        """
+        Segments are yielded when they are available
+
+        Segments appear on a timeline, for dynamic content they are only available at a certain time
+        and sometimes for a limited time. For static content they are all available at the same time.
+
+        :param kwargs: extra args to pass to the segment template
+        :return: yields Segments
+        """
+
+        # segmentBase = self.segmentBase or self.walk_back_get_attr("segmentBase")
+        segmentLists = self.segmentList or self.walk_back_get_attr("segmentList")
+        segmentTemplate = self.segmentTemplate or self.walk_back_get_attr("segmentTemplate")
+
+        if segmentTemplate:
+            yield from segmentTemplate.segments(
+                self.ident,
+                self.base_url,
+                RepresentationID=self.id,
+                Bandwidth=int(self.bandwidth * 1000),
+                **kwargs,
+            )
+        elif segmentLists:
+            for segmentList in segmentLists:
+                yield from segmentList.segments
         else:
-            log.debug(f"Generating segment timeline for {self.root.type} playlist: {ident!r}")
-            for number, segment, available_at in self.segment_timeline(ident):
-                url = self.make_url(base_url, self.fmt_media(Time=segment.t, Number=number, **kwargs))
-                yield url, number, available_at
+            yield Segment(
+                url=self.base_url,
+                duration=0,
+                init=True,
+                content=True,
+                available_at=self.period.availabilityStartTime,
+            )
+
+
+class SubRepresentation(MPDNode):
+    __tag__ = "SubRepresentation"
 
 
 class SegmentTimeline(MPDNode):
     __tag__ = "SegmentTimeline"
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, node, root=None, parent=None, *args, **kwargs):
+        super().__init__(node, root, parent, *args, **kwargs)
 
         self.timescale = self.walk_back_get_attr("timescale")
 
@@ -965,7 +899,7 @@ class SegmentTimeline(MPDNode):
             if t == 0 and tsegment.t is not None:
                 t = tsegment.t
             # check the start time from MPD
-            for _ in range(tsegment.r + 1):
+            for repeated_i in range(tsegment.r + 1):
                 yield TimelineSegment(t, tsegment.d)
                 t += tsegment.d
 
@@ -973,45 +907,19 @@ class SegmentTimeline(MPDNode):
 class _TimelineSegment(MPDNode):
     __tag__ = "S"
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, node, root=None, parent=None, *args, **kwargs):
+        super().__init__(node, root, parent, *args, **kwargs)
 
         self.t = self.attr("t", parser=int)
-        self.d: int = self.attr("d", parser=int, required=True)  # type: ignore[assignment]
+        self.d = self.attr("d", parser=int)
         self.r = self.attr("r", parser=int, default=0)
-
-
-class Initialization(MPDNode):
-    __tag__ = "Initialization"
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-
-        self.source_url = self.attr("sourceURL")
-        self.range = self.attr(
-            "range",
-            parser=MPDParsers.range,
-        )
-
-
-class SegmentURL(MPDNode):
-    __tag__ = "SegmentURL"
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-
-        self.media = self.attr("media")
-        self.media_range = self.attr(
-            "mediaRange",
-            parser=MPDParsers.range,
-        )
 
 
 class ContentProtection(MPDNode):
     __tag__ = "ContentProtection"
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, node, root=None, parent=None, *args, **kwargs):
+        super().__init__(node, root, parent, *args, **kwargs)
 
         self.schemeIdUri = self.attr("schemeIdUri")
         self.value = self.attr("value")
