@@ -33,6 +33,10 @@ Please take a look at the documentation for different ways of installing Streaml
 
 Streamlink is built on top of a plugin system which allows support for new services to be added easily.
 
+This streamlink build adds a --ffmpeg_dkey parameter to decrypt dash content protected by DRM such as ClearKey 😉
+
+**Update 30/3/2023 :** Added a --ffmpeg_dkey_2 parameter to decrypt the second track such as audio tracks. The --ffmpeg_dkey parameter is required to use this param.
+
 Most of the popular streaming services are supported, such as:
 
 - [Twitch](https://www.twitch.tv)
